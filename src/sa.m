@@ -273,10 +273,12 @@ static uint32_t scripting_addition_required_attrib(void)
 
     //
     // NOTE: macOS 27 removed DPDesktopPictureManager, so dppm and move_space
-    // cannot resolve, and set_front_window has no caller.
+    // cannot resolve, and set_front_window has no caller. --load-sa runs before
+    // the workspace_is_macos_* flags are set, so ask for the version directly.
     //
 
-    if (workspace_is_macos_goldengate()) {
+    NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (os_version.majorVersion == 27) {
         required_attrib &= ~(OSAX_ATTRIB_DPPM | OSAX_ATTRIB_MOV_SPACE | OSAX_ATTRIB_SET_WINDOW);
     }
 
