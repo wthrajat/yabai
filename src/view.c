@@ -332,14 +332,37 @@ void window_node_update(struct view *view, struct window_node *node)
     }
 }
 
+//
+// NOTE: Drop every window in the tree from the managed table. Tiling moved them
+// to the below sub-layer and, with purify, removed their shadow. When they stop
+// being tiled for good (untile), undo that like every other untile path does, or
+// they stay under every normal window and Dock clicks and cmd-tab can not raise
+// them. A bsp/stack view that is cleared is re-tiled right away, so it keeps the
+// layer: flipping it for every window would make them flash.
+//
+
+static void window_node_unmanage_windows(struct window_node *node, bool untile)
+{
+    if (node->left)  window_node_unmanage_windows(node->left, untile);
+    if (node->right) window_node_unmanage_windows(node->right, untile);
+
+    for (int i = 0; i < node->window_count; ++i) {
+        uint32_t wid = node->window_list[i];
+        window_manager_remove_managed_window(&g_window_manager, wid);
+        if (!untile) continue;
+
+        struct window *window = window_manager_find_window(&g_window_manager, wid);
+        if (!window) continue;
+
+        window_manager_adjust_layer(window, LAYER_NORMAL);
+        window_manager_purify_window(&g_window_manager, window);
+    }
+}
+
 static void window_node_destroy(struct window_node *node)
 {
     if (node->left)  window_node_destroy(node->left);
     if (node->right) window_node_destroy(node->right);
-
-    for (int i = 0; i < node->window_count; ++i) {
-        window_manager_remove_managed_window(&g_window_manager, node->window_list[i]);
-    }
 
     insert_feedback_destroy(node);
     free(node);
@@ -1017,12 +1040,10 @@ struct view *view_create(uint64_t sid)
 void view_clear(struct view *view)
 {
     if (view->root) {
+        window_node_unmanage_windows(view->root, view->layout == VIEW_FLOAT);
+
         if (view->root->left)  window_node_destroy(view->root->left);
         if (view->root->right) window_node_destroy(view->root->right);
-
-        for (int i = 0; i < view->root->window_count; ++i) {
-            window_manager_remove_managed_window(&g_window_manager, view->root->window_list[i]);
-        }
 
         insert_feedback_destroy(view->root);
         memset(view->root, 0, sizeof(struct window_node));
@@ -1030,9 +1051,16 @@ void view_clear(struct view *view)
     }
 }
 
+//
+// NOTE: The space of this view was destroyed, so its windows are no longer tiled.
+// macOS moves them to another space (e.g. when a display is removed). If that
+// space is float, nothing tiles them again, so they must be untiled here.
+//
+
 void view_destroy(struct view *view)
 {
     if (view->root) {
+        window_node_unmanage_windows(view->root, true);
         window_node_destroy(view->root);
     }
 

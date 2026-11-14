@@ -949,6 +949,51 @@ static EVENT_HANDLER(SLS_WINDOW_ORDERED)
     if (node) SLSOrderWindow(g_connection, node->feedback_window.id, 1, node->window_order[0]);
 }
 
+// NOTE: Apps that hide a window on close (e.g. Electron) order it out without minimizing it or
+// hiding the app, so none of those events arrives to untile it; the window server's own visibility
+// notifications do. The ordered-in state is checked again because these are queued: the window
+// may have been ordered back in (or out) by the time the event is handled.
+static EVENT_HANDLER(SLS_WINDOW_IS_INVISIBLE)
+{
+    uint32_t wid = (uint64_t)(intptr_t) context;
+    debug("%s: %d\n", __FUNCTION__, wid);
+
+    struct window *window = window_manager_find_window(&g_window_manager, wid);
+    if (!window) return;
+
+    if (!__sync_bool_compare_and_swap(&window->id_ptr, &window->id, &window->id)) {
+        debug("%s: %d has been marked invalid by the system, ignoring event..\n", __FUNCTION__, wid);
+        return;
+    }
+
+    uint8_t ordered_in = 0;
+    SLSWindowIsOrderedIn(g_connection, wid, &ordered_in);
+    if (ordered_in) return;
+
+    window_manager_window_did_order_out(&g_window_manager, window);
+}
+
+static EVENT_HANDLER(SLS_WINDOW_IS_VISIBLE)
+{
+    uint32_t wid = (uint64_t)(intptr_t) context;
+    debug("%s: %d\n", __FUNCTION__, wid);
+
+    struct window *window = window_manager_find_window(&g_window_manager, wid);
+    if (!window || !window_check_flag(window, WINDOW_ORDERED_OUT)) return;
+
+    if (!__sync_bool_compare_and_swap(&window->id_ptr, &window->id, &window->id)) {
+        debug("%s: %d has been marked invalid by the system, ignoring event..\n", __FUNCTION__, wid);
+        return;
+    }
+
+    uint8_t ordered_in = 0;
+    SLSWindowIsOrderedIn(g_connection, wid, &ordered_in);
+    if (!ordered_in) return;
+
+    uint64_t sid = space_manager_active_space();
+    window_manager_window_did_order_in(&g_window_manager, window, space_manager_is_window_on_space(sid, window) ? sid : 0);
+}
+
 static EVENT_HANDLER(SLS_WINDOW_DESTROYED)
 {
     uint32_t wid = (uint64_t)(intptr_t) context;
@@ -1114,8 +1159,70 @@ static EVENT_HANDLER(DISPLAY_RESIZED)
     event_signal_push(SIGNAL_DISPLAY_RESIZED, context);
 }
 
+//
+// NOTE: macOS 27 (Golden Gate) posts neither the Dock's AXExpose* notifications nor
+// window server notification 1204, so Mission Control is never detected and a window
+// dragged to another space keeps its tile on the source space. Mission Control is
+// drawn by WindowManager on 27, and its overlay sits on layers 16-19 only while it
+// is open. A drag inside Mission Control still arrives as mouse down/up, so check
+// for the overlay there and enter the existing ENTER -> CHECK_FOR_EXIT -> EXIT path.
+//
+// Based on the patch in asmvik/yabai#2851, without the per-move and per-focus checks.
+//
+
+static bool goldengate_mission_control_overlay_visible(void)
+{
+    CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0);
+    if (!window_list) return false;
+
+    bool found = false;
+    int window_count = CFArrayGetCount(window_list);
+
+    for (int i = 0; i < window_count; ++i) {
+        CFDictionaryRef dictionary = CFArrayGetValueAtIndex(window_list, i);
+
+        CFStringRef owner = CFDictionaryGetValue(dictionary, kCGWindowOwnerName);
+        if (!owner) continue;
+
+        CFNumberRef layer_ref = CFDictionaryGetValue(dictionary, kCGWindowLayer);
+        if (!layer_ref) continue;
+
+        int layer = 0;
+        CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
+        if (layer < 16 || layer > 19) continue;
+
+        bool is_mission_control_owner = CFEqual(CFSTR("WindowManager"), owner) || CFEqual(CFSTR("Dock"), owner);
+        if (is_mission_control_owner) {
+            found = true;
+            break;
+        }
+    }
+
+    CFRelease(window_list);
+    return found;
+}
+
+static void goldengate_detect_mission_control(void)
+{
+    if (!workspace_is_macos_goldengate()) return;
+    if (g_mission_control_mode != MISSION_CONTROL_MODE_INACTIVE) return;
+    if (!goldengate_mission_control_overlay_visible()) return;
+
+    debug("%s: Mission Control overlay is visible\n", __FUNCTION__);
+
+    //
+    // NOTE: Mark Mission Control as open before MISSION_CONTROL_ENTER is handled, so the
+    // mouse event that detected it is ignored and queued events do not post another enter.
+    //
+
+    g_mission_control_mode = MISSION_CONTROL_MODE_SHOW;
+    event_loop_post(&g_event_loop, MISSION_CONTROL_ENTER, NULL, 0);
+}
+
 static EVENT_HANDLER(MOUSE_DOWN)
 {
+    goldengate_detect_mission_control();
+
     if (mission_control_is_active())                     goto out;
     if (g_mouse_state.current_action != MOUSE_MODE_NONE) goto out;
 
@@ -1153,6 +1260,8 @@ out:
 
 static EVENT_HANDLER(MOUSE_UP)
 {
+    goldengate_detect_mission_control();
+
     if (mission_control_is_active()) goto out;
     if (!g_mouse_state.window)       goto res;
 
@@ -1342,6 +1451,60 @@ out:
     CFRelease(context);
 }
 
+//
+// NOTE: The AX api reports menus opening and closing, but the close is never
+// delivered when the owning application terminates while a menu is open. ffm
+// used to stay disabled until the count returned to zero, so one lost close
+// disabled it until yabai was restarted. A non-zero count is therefore checked
+// against the window server, and discarded when no menu is on screen.
+//
+
+static int is_menu_open;
+static uint64_t menu_checked_at;
+
+static bool menu_is_open(void)
+{
+    if (!is_menu_open) return false;
+
+    uint64_t now = read_os_timer();
+    float dt = ((float)(now - menu_checked_at)) * (1000.0f / (float)read_os_freq());
+    if (dt < 250.0f) return true;
+
+    menu_checked_at = now;
+
+    bool found = false;
+    int menu_level = CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey);
+
+    CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, 0);
+    if (window_list) {
+        int window_count = CFArrayGetCount(window_list);
+
+        for (int i = 0; i < window_count; ++i) {
+            CFDictionaryRef dictionary = CFArrayGetValueAtIndex(window_list, i);
+
+            CFNumberRef layer_ref = CFDictionaryGetValue(dictionary, kCGWindowLayer);
+            if (!layer_ref) continue;
+
+            int layer = 0;
+            CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
+
+            if (layer == menu_level) {
+                found = true;
+                break;
+            }
+        }
+
+        CFRelease(window_list);
+    }
+
+    if (!found) {
+        debug("%s: no menu on screen, discarding stale count %d\n", __FUNCTION__, is_menu_open);
+        is_menu_open = 0;
+    }
+
+    return found;
+}
+
 static EVENT_HANDLER(MOUSE_MOVED)
 {
     if (g_window_manager.ffm_mode == FFM_DISABLED) goto out;
@@ -1359,6 +1522,7 @@ static EVENT_HANDLER(MOUSE_MOVED)
     if (window) {
         if (window->id == g_window_manager.focused_window_id) goto out;
         if (!window_manager_is_window_eligible(window))       goto out;
+        if (menu_is_open())                                   goto out;
 
         if (g_window_manager.ffm_mode == FFM_AUTOFOCUS) {
 
@@ -1486,6 +1650,17 @@ static EVENT_HANDLER(MISSION_CONTROL_CHECK_FOR_EXIT)
 {
     if (!mission_control_is_active()) return;
 
+    if (workspace_is_macos_goldengate()) {
+        if (goldengate_mission_control_overlay_visible()) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.1f * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+                event_loop_post(&g_event_loop, MISSION_CONTROL_CHECK_FOR_EXIT, NULL, 0);
+            });
+        } else {
+            event_loop_post(&g_event_loop, MISSION_CONTROL_EXIT, NULL, 0);
+        }
+        return;
+    }
+
     CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly, 0);
     int window_count = CFArrayGetCount(window_list);
     bool found = false;
@@ -1559,30 +1734,16 @@ static EVENT_HANDLER(DOCK_DID_RESTART)
     event_signal_push(SIGNAL_DOCK_DID_RESTART, NULL);
 }
 
-static enum ffm_mode ffm_value;
-static int is_menu_open = 0;
-
 static EVENT_HANDLER(MENU_OPENED)
 {
     debug("%s\n", __FUNCTION__);
     ++is_menu_open;
-
-    if (is_menu_open == 1) {
-        ffm_value = g_window_manager.ffm_mode;
-        g_window_manager.ffm_mode = FFM_DISABLED;
-    }
 }
 
 static EVENT_HANDLER(MENU_CLOSED)
 {
     debug("%s\n", __FUNCTION__);
-    --is_menu_open;
-
-    if (is_menu_open == 0) {
-        g_window_manager.ffm_mode = ffm_value;
-    } else if (is_menu_open < 0) {
-        is_menu_open = 0;
-    }
+    if (is_menu_open > 0) --is_menu_open;
 }
 
 static EVENT_HANDLER(MENU_BAR_HIDDEN_CHANGED)

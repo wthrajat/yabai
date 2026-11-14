@@ -267,6 +267,24 @@ out:
     return result;
 }
 
+static uint32_t scripting_addition_required_attrib(void)
+{
+    uint32_t required_attrib = OSAX_ATTRIB_ALL;
+
+    //
+    // NOTE: macOS 27 removed DPDesktopPictureManager, so dppm and move_space
+    // cannot resolve, and set_front_window has no caller. --load-sa runs before
+    // the workspace_is_macos_* flags are set, so ask for the version directly.
+    //
+
+    NSOperatingSystemVersion os_version = [[NSProcessInfo processInfo] operatingSystemVersion];
+    if (os_version.majorVersion == 27) {
+        required_attrib &= ~(OSAX_ATTRIB_DPPM | OSAX_ATTRIB_MOV_SPACE | OSAX_ATTRIB_SET_WINDOW);
+    }
+
+    return required_attrib;
+}
+
 static int scripting_addition_perform_validation(void)
 {
     uint32_t attrib = 0;
@@ -279,7 +297,8 @@ static int scripting_addition_perform_validation(void)
     }
 
     if (string_equals(version, OSAX_VERSION)) {
-        if ((attrib & OSAX_ATTRIB_ALL) == OSAX_ATTRIB_ALL) {
+        uint32_t required_attrib = scripting_addition_required_attrib();
+        if ((attrib & required_attrib) == required_attrib) {
             notify("scripting-addition", "payload v%s", version);
             return 0;
         }
