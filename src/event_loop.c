@@ -1342,6 +1342,60 @@ out:
     CFRelease(context);
 }
 
+//
+// NOTE: The AX api reports menus opening and closing, but the close is never
+// delivered when the owning application terminates while a menu is open. ffm
+// used to stay disabled until the count returned to zero, so one lost close
+// disabled it until yabai was restarted. A non-zero count is therefore checked
+// against the window server, and discarded when no menu is on screen.
+//
+
+static int is_menu_open;
+static uint64_t menu_checked_at;
+
+static bool menu_is_open(void)
+{
+    if (!is_menu_open) return false;
+
+    uint64_t now = read_os_timer();
+    float dt = ((float)(now - menu_checked_at)) * (1000.0f / (float)read_os_freq());
+    if (dt < 250.0f) return true;
+
+    menu_checked_at = now;
+
+    bool found = false;
+    int menu_level = CGWindowLevelForKey(kCGPopUpMenuWindowLevelKey);
+
+    CFArrayRef window_list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, 0);
+    if (window_list) {
+        int window_count = CFArrayGetCount(window_list);
+
+        for (int i = 0; i < window_count; ++i) {
+            CFDictionaryRef dictionary = CFArrayGetValueAtIndex(window_list, i);
+
+            CFNumberRef layer_ref = CFDictionaryGetValue(dictionary, kCGWindowLayer);
+            if (!layer_ref) continue;
+
+            int layer = 0;
+            CFNumberGetValue(layer_ref, kCFNumberIntType, &layer);
+
+            if (layer == menu_level) {
+                found = true;
+                break;
+            }
+        }
+
+        CFRelease(window_list);
+    }
+
+    if (!found) {
+        debug("%s: no menu on screen, discarding stale count %d\n", __FUNCTION__, is_menu_open);
+        is_menu_open = 0;
+    }
+
+    return found;
+}
+
 static EVENT_HANDLER(MOUSE_MOVED)
 {
     if (g_window_manager.ffm_mode == FFM_DISABLED) goto out;
@@ -1359,6 +1413,7 @@ static EVENT_HANDLER(MOUSE_MOVED)
     if (window) {
         if (window->id == g_window_manager.focused_window_id) goto out;
         if (!window_manager_is_window_eligible(window))       goto out;
+        if (menu_is_open())                                   goto out;
 
         if (g_window_manager.ffm_mode == FFM_AUTOFOCUS) {
 
@@ -1559,30 +1614,16 @@ static EVENT_HANDLER(DOCK_DID_RESTART)
     event_signal_push(SIGNAL_DOCK_DID_RESTART, NULL);
 }
 
-static enum ffm_mode ffm_value;
-static int is_menu_open = 0;
-
 static EVENT_HANDLER(MENU_OPENED)
 {
     debug("%s\n", __FUNCTION__);
     ++is_menu_open;
-
-    if (is_menu_open == 1) {
-        ffm_value = g_window_manager.ffm_mode;
-        g_window_manager.ffm_mode = FFM_DISABLED;
-    }
 }
 
 static EVENT_HANDLER(MENU_CLOSED)
 {
     debug("%s\n", __FUNCTION__);
-    --is_menu_open;
-
-    if (is_menu_open == 0) {
-        g_window_manager.ffm_mode = ffm_value;
-    } else if (is_menu_open < 0) {
-        is_menu_open = 0;
-    }
+    if (is_menu_open > 0) --is_menu_open;
 }
 
 static EVENT_HANDLER(MENU_BAR_HIDDEN_CHANGED)
