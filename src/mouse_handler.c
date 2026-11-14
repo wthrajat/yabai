@@ -275,7 +275,12 @@ static void *mouse_handler_thread(void *context)
 {
     struct mouse_state *mouse_state = context;
 
-    mouse_state->runloop = CFRunLoopGetCurrent();
+    //
+    // NOTE: Retain the run loop so mouse_handler_end can still use it after this
+    // thread has exited and the thread-local run loop would otherwise be freed.
+    //
+
+    mouse_state->runloop = (CFRunLoopRef) CFRetain(CFRunLoopGetCurrent());
     CFRunLoopAddSource(mouse_state->runloop, mouse_state->runloop_source, kCFRunLoopCommonModes);
     dispatch_semaphore_signal(mouse_state->ready);
     CFRunLoopRun();
@@ -309,11 +314,18 @@ void mouse_handler_end(struct mouse_state *mouse_state)
 {
     if (!mouse_state->handle) return;
 
+    //
+    // NOTE: Stop the tap thread before invalidating the mach port. Invalidating first
+    // removes the source, which lets the thread exit while it is still being used here.
+    //
+
     CGEventTapEnable(mouse_state->handle, false);
-    CFMachPortInvalidate(mouse_state->handle);
     CFRunLoopRemoveSource(mouse_state->runloop, mouse_state->runloop_source, kCFRunLoopCommonModes);
     CFRunLoopStop(mouse_state->runloop);
     pthread_join(mouse_state->thread, NULL);
+    CFRelease(mouse_state->runloop);
+    mouse_state->runloop = NULL;
+    CFMachPortInvalidate(mouse_state->handle);
     CFRelease(mouse_state->runloop_source);
     CFRelease(mouse_state->handle);
     __atomic_store_n(&mouse_state->handle, NULL, __ATOMIC_RELEASE);
